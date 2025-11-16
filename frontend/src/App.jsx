@@ -3,6 +3,7 @@ import TopicForm from './components/TopicForm';
 import MessageSender from './components/MessageSender';
 import MessageList from './components/MessageList';
 import FilterBar from './components/FilterBar';
+import TopicLoader from './components/TopicLoader';
 import axios from 'axios';
 
 export default function App() {
@@ -68,11 +69,17 @@ export default function App() {
           </p>
         </header>
 
-        <section className="mb-4">
-          <TopicForm
-            onTopicCreated={handleTopicCreated}
-            currentTopic={topicId}
-          />
+        <section className="mb-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="md:col-span-1">
+            <TopicForm onTopicCreated={handleTopicCreated} currentTopic={topicId} />
+          </div>
+
+          <div className="md:col-span-2 grid grid-cols-1 gap-4">
+            <TopicLoader onLoaded={(id) => {
+              // optionally set topicId to view/poll this topic
+              // setTopicId(id);
+            }} />
+          </div>
         </section>
 
         <section className="mb-4 grid grid-cols-1 md:grid-cols-2 gap-4">

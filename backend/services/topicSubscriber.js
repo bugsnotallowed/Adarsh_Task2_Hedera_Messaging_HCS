@@ -1,103 +1,147 @@
-const axios = require("axios");
-const { TopicMessageQuery } = require("@hashgraph/sdk");
-const hederaClient = require("./hederaClient");
-const encryptService = require("./encryptService");
+// backend/services/topicSubscriber.js
+const axios = require('axios');
+const { TopicMessageQuery } = require('@hashgraph/sdk');
+const hederaClient = require('./hederaClient');
+const encryptService = require('./encryptService');
+const mongo = require('./mongo');
 
-const messagesCache = {};
+const TopicModel = require('../models/Topic');
+const MessageModel = require('../models/Message');
 
-async function waitForTopicInMirror(topicId) {
-  const url = `https://testnet.mirrornode.hedera.com/api/v1/topics/${topicId}/messages`;
+const messagesCache = {}; // in-memory cache (optional fast read)
 
-  console.log(`🔍 Checking mirror node for topic ${topicId}...`);
+async function waitForTopicInMirror(topicId, timeoutMs = 15000) {
+  const url = `https://testnet.mirrornode.hedera.com/api/v1/topics/${topicId}`;
+  const start = Date.now();
 
-  for (let i = 0; i < 20; i++) {
-    // retry for ~10 seconds
+  while (Date.now() - start < timeoutMs) {
     try {
       const res = await axios.get(url);
-      if (res.data && res.data.topic_id) {
-        console.log(`✅ Mirror node indexed topic ${topicId}`);
+      if (res.data && (res.data.topic_id || res.status === 200)) {
         return true;
       }
     } catch (err) {
-      // Topic not found yet — wait
+      // ignore - not indexed yet
     }
-
-    console.log(`⏳ Topic ${topicId} not found in mirror. Retrying...`);
     await new Promise((r) => setTimeout(r, 500));
   }
-
-  console.log(`❌ Mirror node did not index topic ${topicId} in time.`);
   return false;
 }
 
 async function subscribeToTopic(topicId) {
   const client = hederaClient();
 
-  console.log(`📡 Subscribing to topic ${topicId}`);
+  if (!messagesCache[topicId]) messagesCache[topicId] = [];
 
-  messagesCache[topicId] = [];
+  console.log(`📡 Subscribing to topic ${topicId} (background)`);
 
-  new TopicMessageQuery().setTopicId(topicId).subscribe(
-    client,
-    (msg) => {
-      try {
-        // Convert SDK bytes → base64 string
-        const encryptedBase64 = Buffer.from(msg.contents).toString("base64");
+  new TopicMessageQuery()
+    .setTopicId(topicId)
+    .subscribe(
+      client,
+      async (msg) => {
+        try {
+          // 1) turn SDK bytes -> base64 string
+          const encryptedBase64 = Buffer.from(msg.contents).toString('base64');
 
-        // Convert base64 → original encrypted text
-        const encryptedOriginal = Buffer.from(
-          encryptedBase64,
-          "base64"
-        ).toString("utf8");
+          // 2) base64 -> original encrypted utf8 string
+          const encryptedOriginal = Buffer.from(encryptedBase64, 'base64').toString('utf8');
 
-        // Decrypt original
-        const decrypted = encryptService.decrypt(encryptedOriginal);
+          // 3) attempt decrypt (if AES key is correct)
+          let decrypted = null;
+          try {
+            decrypted = encryptService.decrypt(encryptedOriginal);
+          } catch (e) {
+            // decryption may fail if message not encrypted by our key; that's okay
+          }
 
-        const entry = {
-          message: decrypted,
-          timestamp: msg.consensusTimestamp.toString(),
-        };
+          const senderAcc =
+            msg.initialTransactionId &&
+            msg.initialTransactionId.accountId &&
+            msg.initialTransactionId.accountId.toString
+              ? msg.initialTransactionId.accountId.toString()
+              : null;
 
-        messagesCache[topicId].push(entry);
-        console.log("📩 New message:", entry);
-      } catch (err) {
-        console.error("❌ Message decryption error:", err);
+          const sequenceNumber = msg.sequenceNumber ? Number(msg.sequenceNumber.toString()) : null;
+          const consensusTimestamp = msg.consensusTimestamp ? msg.consensusTimestamp.toString() : new Date().toISOString();
+
+          // Save to MongoDB
+          try {
+            await mongo.connect(); // ensure connection
+            const messageDoc = new MessageModel({
+              topicId,
+              encrypted: encryptedOriginal,
+              decrypted,
+              senderId: senderAcc,
+              timestamp: consensusTimestamp,
+              sequenceNumber,
+              receivedBySubscriber: true,
+            });
+            await messageDoc.save();
+          } catch (dbErr) {
+            console.error('❌ DB save error for message:', dbErr);
+          }
+
+          // Update in-memory cache (fast read)
+          messagesCache[topicId].push({
+            message: decrypted || encryptedOriginal,
+            encrypted: encryptedOriginal,
+            senderId: senderAcc,
+            timestamp: consensusTimestamp,
+            sequenceNumber,
+          });
+
+          // Update Topic's subscribers list (if sender present)
+          if (senderAcc) {
+            try {
+              await TopicModel.updateOne(
+                { topicId },
+                { $addToSet: { subscribers: { subscriberId: senderAcc } } }
+              );
+            } catch (err) {
+              console.error('❌ Error updating Topic subscribers:', err);
+            }
+          }
+
+          console.log('📩 New message cached + persisted:', {
+            topicId,
+            sender: senderAcc,
+            ts: consensusTimestamp,
+          });
+        } catch (err) {
+          console.error('❌ Message handler error:', err);
+        }
+      },
+      (err) => {
+        // SDK bug: sometimes TopicMessage arrives in error handler — handle gracefully
+        if (err && err.consensusTimestamp) {
+          console.warn('⚠ SDK quirk: TopicMessage in error handler, ignoring.');
+          return;
+        }
+        console.error('❌ Subscriber error:', err);
       }
-    },
-    (err) => {
-      // Hedera SDK bug: sometimes TopicMessage is passed into error callback
-      if (err instanceof Object && err.consensusTimestamp) {
-        console.log(
-          "⚠ SDK bug: TopicMessage incorrectly routed to onError(), ignoring."
-        );
-        return;
-      }
-
-      console.error("❌ Real subscriber error:", err);
-    }
-  );
+    );
 }
 
 module.exports = {
   messagesCache,
 
   async startSubscription(topicId) {
-    // Only subscribe once
     if (messagesCache[topicId]) {
-      console.log("ℹ️ Already subscribed to topic", topicId);
+      console.log('ℹ️ Already subscribed to topic', topicId);
       return;
     }
 
-    // WAIT until mirror has indexed topic
-    const ready = await waitForTopicInMirror(topicId);
+    const ready = await waitForTopicInMirror(topicId, 15000);
     if (!ready) {
-      console.error(
-        `❌ Cannot subscribe: topic ${topicId} never reached mirror.`
-      );
+      console.error(`❌ Mirror node did not index topic ${topicId} in time.`);
       return;
     }
 
-    // Subscribe AFTER mirror readiness
-    await subscribeToTopic(topicId);
+    // ensure messagesCache exists
+    messagesCache[topicId] = [];
+
+    // Start subscription
+    subscribeToTopic(topicId);
   },
 };

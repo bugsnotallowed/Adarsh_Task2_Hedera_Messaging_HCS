@@ -1,14 +1,12 @@
-const express = require("express");
+// backend/routes/hederaRoutes.js
+const express = require('express');
 const router = express.Router();
+const controller = require('../controllers/hederaController');
 
-const {
-  createTopic,
-  sendMessage,
-  getMessages
-} = require("../controllers/hederaController");
-
-router.post("/topic", createTopic);
-router.post("/message", sendMessage);
-router.get("/messages/:topicId", getMessages);
+router.post('/topic', controller.createTopic);
+router.post('/message', controller.sendMessage);
+router.get('/messages/:topicId', controller.getMessages);
+router.post('/subscribe', controller.subscribe);
+router.get('/fetch/:topicId', controller.fetchMirrorMessages);
 
 module.exports = router;
